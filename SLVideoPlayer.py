@@ -12,18 +12,109 @@ if sys.platform == 'win32':
     # Add current directory to PATH so libmpv-2.dll can be found
     os.environ["PATH"] = os.path.dirname(os.path.abspath(__file__)) + os.pathsep + os.environ["PATH"]
 
-from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
-                             QHBoxLayout, QPushButton, QSlider, QLabel, 
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
+                             QHBoxLayout, QPushButton, QSlider, QLabel,
                              QFileDialog, QToolBar, QStyle, QMessageBox,
-                             QComboBox, QSpinBox, QInputDialog)
-from PyQt6.QtCore import Qt, QTimer, QUrl
-from PyQt6.QtGui import QAction, QKeySequence
+                             QComboBox, QSpinBox, QInputDialog, QGraphicsOpacityEffect)
+from PyQt6.QtCore import Qt, QTimer, QUrl, QPropertyAnimation, QEasingCurve, QPoint, QRect, QEvent
+from PyQt6.QtGui import QAction, QKeySequence, QCursor, QFont, QPainter, QPen, QColor, QBrush
 import mpv
 from color_dialog import ColorCorrectionDialog
 from recent_files_dialog import RecentFilesDialog
+from settings import Settings
+from settings_dialog import SettingsDialog
 
 # Fix for Windows locale
 locale.setlocale(locale.LC_NUMERIC, 'C')
+
+class ZoomOverlay(QWidget):
+    """Transparent overlay for Shift+click-drag region zoom selection."""
+
+    def __init__(self, parent, player_ref):
+        super().__init__(parent)
+        self.player_ref = player_ref  # reference to VideoPlayer instance
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setMouseTracking(True)
+        self._origin = None
+        self._rect = QRect()
+        self._active = False
+        self.hide()  # hidden until Shift is held
+
+    # ---- drawing ----
+    def paintEvent(self, event):
+        if not self._active or self._rect.isNull():
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        # Semi-transparent fill
+        painter.setBrush(QBrush(QColor(0, 120, 215, 50)))
+        # Solid border
+        pen = QPen(QColor(0, 120, 215, 200), 2, Qt.PenStyle.SolidLine)
+        painter.setPen(pen)
+        painter.drawRect(self._rect.normalized())
+        painter.end()
+
+    # ---- mouse handling ----
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._origin = event.pos()
+            self._rect = QRect(self._origin, self._origin)
+            self._active = True
+            self.update()
+
+    def mouseMoveEvent(self, event):
+        if self._active and self._origin is not None:
+            self._rect = QRect(self._origin, event.pos()).normalized()
+            self.update()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self._active:
+            self._active = False
+            rect = QRect(self._origin, event.pos()).normalized()
+            self._rect = QRect()
+            self.update()
+            # Only zoom if the selection is large enough (avoid accidental clicks)
+            if rect.width() > 10 and rect.height() > 10:
+                self._apply_region_zoom(rect)
+            self._origin = None
+
+    # ---- compute zoom + pan from selected rectangle ----
+    def _apply_region_zoom(self, rect):
+        vp = self.player_ref
+        widget_w = self.width()
+        widget_h = self.height()
+
+        if widget_w == 0 or widget_h == 0:
+            return
+
+        # Normalised centre of the selected rectangle (0-1 range, 0.5 = centre)
+        sel_cx = (rect.x() + rect.width() / 2) / widget_w
+        sel_cy = (rect.y() + rect.height() / 2) / widget_h
+
+        # Zoom factor: fit the smaller dimension ratio so the selection fills the view
+        zoom_x = widget_w / rect.width()
+        zoom_y = widget_h / rect.height()
+        zoom_factor = min(zoom_x, zoom_y)
+
+        # Clamp to the spinbox range (50%-300%)
+        zoom_percent = max(50, min(300, int(zoom_factor * 100)))
+
+        # Pan: MPV pan is the offset from centre in fractions of the video size.
+        # positive pan_x = video shifts right = viewport sees left side
+        # We want the selection centre to become the new viewport centre.
+        pan_x = 0.5 - sel_cx   # offset from widget centre
+        pan_y = 0.5 - sel_cy
+
+        # Apply
+        try:
+            vp.zoom_spinbox.setValue(zoom_percent)
+            vp.player.video_pan_x = max(-1.0, min(1.0, pan_x))
+            vp.player.video_pan_y = max(-1.0, min(1.0, pan_y))
+        except Exception as e:
+            print(f"Region zoom error: {e}")
+
 
 class VideoPlayer(QMainWindow):
     def __init__(self):
@@ -34,10 +125,15 @@ class VideoPlayer(QMainWindow):
         self.recent_files = []  # List to store recent files
         self.max_recent_files = 50  # Maximum number of recent files to keep
         self.recent_files_path = "recent_files.json"  # File to save recent files
+        self.settings = Settings()  # Initialize settings
+        
+        # Frame stepping mode variables
+        self.frame_step_mode = False
         
         self.load_recent_files()  # Load recent files from disk
         self.init_ui()
         self.init_player()
+        QApplication.instance().installEventFilter(self)
         
     def init_ui(self):
         self.setWindowTitle("Advanced Video Player")
@@ -57,6 +153,10 @@ class VideoPlayer(QMainWindow):
         self.video_widget.setStyleSheet("background-color: black;")
         self.video_widget.setMinimumSize(640, 480)
         main_layout.addWidget(self.video_widget, stretch=1)
+
+        # Transparent overlay for Shift+drag region zoom
+        self.zoom_overlay = ZoomOverlay(self.video_widget, self)
+        self.zoom_overlay.setGeometry(self.video_widget.rect())
         
         # Controls layout
         controls_layout = QVBoxLayout()
@@ -83,6 +183,13 @@ class VideoPlayer(QMainWindow):
         stop_button = QPushButton("Stop")
         stop_button.clicked.connect(self.stop_video)
         playback_layout.addWidget(stop_button)
+        
+        # Frame Step Mode Toggle
+        self.frame_step_button = QPushButton("Frame Step Mode: OFF")
+        self.frame_step_button.setCheckable(True)
+        self.frame_step_button.clicked.connect(self.toggle_frame_step_mode)
+        self.frame_step_button.setToolTip("Enable frame-by-frame navigation with mouse wheel")
+        playback_layout.addWidget(self.frame_step_button)
         
         # Speed control
         playback_layout.addWidget(QLabel("Speed:"))
@@ -152,6 +259,8 @@ class VideoPlayer(QMainWindow):
         # Initialize bookmark positions
         self.mark_in_pos = None
         self.mark_out_pos = None
+
+        self.setAcceptDrops(True)
 
     def create_toolbar(self):
         toolbar = QToolBar()
@@ -227,22 +336,79 @@ class VideoPlayer(QMainWindow):
         recent_action.triggered.connect(self.show_recent_files)
         toolbar.addAction(recent_action)
 
+        # Settings
+        settings_action = QAction("Settings", self)
+        settings_action.setShortcut(QKeySequence("Ctrl+,"))
+        settings_action.triggered.connect(self.open_settings)
+        toolbar.addAction(settings_action)
+        
+        toolbar.addSeparator()
+
     def init_player(self):
         try:
             self.player = mpv.MPV(
                 wid=str(int(self.video_widget.winId())),
                 input_default_bindings=True,
                 input_vo_keyboard=True,
-                hwdec='auto',
+                hwdec='auto-copy',
                 vo='gpu',
                 keep_open='yes',
-                loop='no'
+                loop='no',
+                deinterlace=True
             )
             self.player.volume = 50
             self.current_rotation = 0
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to initialize player: {str(e)}\n\nMake sure libmpv-2.dll is in the same folder as this script.")
             sys.exit(1)
+    
+    def toggle_frame_step_mode(self):
+        """Toggle frame stepping mode on/off"""
+        self.frame_step_mode = self.frame_step_button.isChecked()
+        
+        if self.frame_step_mode:
+            self.frame_step_button.setText("Frame Step Mode: ON")
+            self.frame_step_button.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold;")
+            
+            # Pause video when entering frame step mode
+            if not self.player.pause:
+                self.player.pause = True
+                self.play_button.setText("Play")
+            
+            QMessageBox.information(self, "Frame Step Mode", 
+                "Frame Step Mode enabled!\n\n"
+                "Scroll mouse wheel FORWARD to step forward frame by frame.\n"
+                "Scroll mouse wheel BACKWARD to step backward frame by frame.\n\n"
+                "Click the button again to exit this mode.")
+        else:
+            self.frame_step_button.setText("Frame Step Mode: OFF")
+            self.frame_step_button.setStyleSheet("")
+    
+    def wheelEvent(self, event):
+        """Handle mouse wheel for frame stepping"""
+        # Only process wheel events in frame step mode
+        if not self.frame_step_mode:
+            super().wheelEvent(event)
+            return
+        
+        # Get wheel delta (positive = scroll up/forward, negative = scroll down/backward)
+        delta = event.angleDelta().y()
+        
+        if delta > 0:
+            # Scroll forward - step forward one frame
+            try:
+                self.player.command('frame-step')
+            except Exception as e:
+                print(f"Error stepping frame forward: {e}")
+        elif delta < 0:
+            # Scroll backward - step backward one frame
+            try:
+                self.player.command('frame-back-step')
+            except Exception as e:
+                print(f"Error stepping frame backward: {e}")
+        
+        # Accept the event to prevent it from propagating
+        event.accept()
     
     def get_all_drives(self):
         """Get all available drives including mapped network drives using multiple detection methods"""
@@ -540,6 +706,11 @@ class VideoPlayer(QMainWindow):
         self.recent_files = list(reversed(dialog.recent_files))
         self.save_recent_files()
 
+    def open_settings(self):
+        """Open the settings dialog"""
+        dialog = SettingsDialog(self.settings, self)
+        dialog.exec()
+
     def toggle_play_pause(self):
         if self.player.pause:
             self.player.pause = False
@@ -655,14 +826,16 @@ class VideoPlayer(QMainWindow):
             print(f"Error setting gamma: {e}")
 
     def apply_sharpness(self, value):
-        """Apply sharpness adjustment to video (using hue as proxy since mpv doesn't have sharpness)"""
+        """Apply sharpness adjustment to video via unsharp mask filter"""
         try:
-            # MPV doesn't have direct sharpness control
-            # We'll use this as a placeholder or implement via video filters
-            # For now, just store the value
-            if not hasattr(self, 'sharpness_value'):
-                self.sharpness_value = 0
             self.sharpness_value = value
+            if value == 0:
+                # Remove the unsharp filter
+                self.player.vf = ""
+            else:
+                # Map slider 0-100 to unsharp amount 0.0-3.0
+                amount = value / 100.0 * 3.0
+                self.player.vf = f"lavfi=[unsharp=5:5:{amount:.2f}:5:5:{amount:.2f}]"
         except Exception as e:
             print(f"Error setting sharpness: {e}")
 
@@ -673,8 +846,8 @@ class VideoPlayer(QMainWindow):
             self.player.contrast = 0
             self.player.saturation = 0
             self.player.gamma = 0
-            if hasattr(self, 'sharpness_value'):
-                self.sharpness_value = 0
+            self.sharpness_value = 0
+            self.player.vf = ""
         except Exception as e:
             print(f"Error resetting color correction: {e}")
     
@@ -775,13 +948,13 @@ class VideoPlayer(QMainWindow):
         if not self.current_file:
             return None
         
-        # Get the directory where the video is located
-        video_dir = os.path.dirname(self.current_file)
+        # Get the download folder from settings
+        download_folder = self.settings.get_download_folder()
         
         # Generate filename with sequential number
         while True:
             filename = f"{base_name}_{self.screenshot_counter:04d}{extension}"
-            full_path = os.path.join(video_dir, filename)
+            full_path = os.path.join(download_folder, filename)
             
             # Check if file exists
             if not os.path.exists(full_path):
@@ -790,6 +963,34 @@ class VideoPlayer(QMainWindow):
             # If file exists, increment counter and try again
             self.screenshot_counter += 1
     
+    def flash_text(self, message, duration=1500):
+        """Show a temporary text overlay on the video widget that fades out"""
+        label = QLabel(message, self.video_widget)
+        label.setFont(QFont("Arial", 16, QFont.Weight.Bold))
+        label.setStyleSheet(
+            "color: white; background-color: rgba(0, 0, 0, 160); "
+            "padding: 8px 16px; border-radius: 6px;"
+        )
+        label.adjustSize()
+        # Center horizontally, position near bottom
+        x = (self.video_widget.width() - label.width()) // 2
+        y = self.video_widget.height() - label.height() - 40
+        label.move(x, y)
+        label.show()
+
+        # Fade out animation
+        opacity_effect = QGraphicsOpacityEffect(label)
+        label.setGraphicsEffect(opacity_effect)
+        fade = QPropertyAnimation(opacity_effect, b"opacity")
+        fade.setDuration(duration)
+        fade.setStartValue(1.0)
+        fade.setEndValue(0.0)
+        fade.setEasingCurve(QEasingCurve.Type.InQuad)
+        fade.finished.connect(label.deleteLater)
+        fade.start()
+        # Keep reference so animation isn't garbage collected
+        label._fade_anim = fade
+
     def take_screenshot(self):
         """Take a screenshot of the current frame, respecting zoom"""
         if not self.current_file:
@@ -803,7 +1004,7 @@ class VideoPlayer(QMainWindow):
             save_path = self.get_next_screenshot_path(base_name, ".png")
             
             if not save_path:
-                QMessageBox.warning(self, "Error", "Could not determine save path")
+                self.flash_text("Could not determine save path")
                 return
             
             # Check if we're zoomed
@@ -813,16 +1014,14 @@ class VideoPlayer(QMainWindow):
                 # No zoom, simple screenshot
                 self.player.screenshot_to_file(save_path)
                 self.screenshot_counter += 1
-                QMessageBox.information(self, "Success", 
-                    f"Screenshot saved to:\n{save_path}\n\n"
-                    f"Screenshot #{self.screenshot_counter - 1}")
+                self.flash_text(f"Screenshot saved: {Path(save_path).name}")
             else:
                 # Zoomed - need to capture the zoomed area
                 self.take_zoomed_screenshot(save_path, current_zoom)
                 self.screenshot_counter += 1
-        
+
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to take screenshot: {str(e)}")
+            self.flash_text(f"Screenshot failed: {str(e)}")
 
     def take_zoomed_screenshot(self, save_path, zoom_percent):
         """Take a screenshot of the zoomed area using video pan/zoom values"""
@@ -878,22 +1077,14 @@ class VideoPlayer(QMainWindow):
             except:
                 pass
             
-            QMessageBox.information(self, "Success", 
-                f"Zoomed screenshot saved to:\n{save_path}\n\n"
-                f"Screenshot #{self.screenshot_counter}\n"
-                f"Zoom: {zoom_percent}%\n"
-                f"Captured area: {right-left}x{bottom-top} pixels")
-        
+            self.flash_text(f"Screenshot saved: {Path(save_path).name} ({right-left}x{bottom-top})")
+
         except ImportError:
-            QMessageBox.warning(self, "PIL Required", 
-                "The Pillow library is required for zoomed screenshots.\n\n"
-                "Install it with: pip install Pillow\n\n"
-                "For now, taking a full-frame screenshot...")
             self.player.screenshot_to_file(save_path)
-            QMessageBox.information(self, "Success", f"Screenshot saved to:\n{save_path}")
-        
+            self.flash_text(f"Screenshot saved: {Path(save_path).name} (full frame, install Pillow for zoom crop)")
+
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to take zoomed screenshot: {str(e)}")
+            self.flash_text(f"Zoomed screenshot failed: {str(e)}")
     
     def delete_video_file(self):
         if not self.current_file:
@@ -920,86 +1111,165 @@ class VideoPlayer(QMainWindow):
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to delete file: {str(e)}")
     
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Type.KeyPress and self.isActiveWindow():
+            mods = event.modifiers()
+            key = event.key()
+            if (mods & Qt.KeyboardModifier.AltModifier) and key in (
+                Qt.Key.Key_Up, Qt.Key.Key_Down, Qt.Key.Key_Left, Qt.Key.Key_Right
+            ):
+                self._apply_pan(key)
+                return True  # consume — no widget zooms or scrolls
+        return super().eventFilter(obj, event)
+
+    def _apply_pan(self, key):
+        if self.zoom_spinbox.value() <= 100:
+            return
+        pan_speed = 0.05
+        try:
+            if key == Qt.Key.Key_Left:
+                self.player.video_pan_x = min(1.0, (self.player.video_pan_x or 0.0) + pan_speed)
+            elif key == Qt.Key.Key_Right:
+                self.player.video_pan_x = max(-1.0, (self.player.video_pan_x or 0.0) - pan_speed)
+            elif key == Qt.Key.Key_Up:
+                self.player.video_pan_y = min(1.0, (self.player.video_pan_y or 0.0) + pan_speed)
+            elif key == Qt.Key.Key_Down:
+                self.player.video_pan_y = max(-1.0, (self.player.video_pan_y or 0.0) - pan_speed)
+        except Exception as e:
+            print(f"Pan error: {e}")
+
+    _VIDEO_EXTENSIONS = {'.mp4', '.avi', '.mkv', '.mov', '.flv', '.wmv', '.webm', '.m4v', '.mpg', '.mpeg'}
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            for url in event.mimeData().urls():
+                if url.isLocalFile() and Path(url.toLocalFile()).suffix.lower() in self._VIDEO_EXTENSIONS:
+                    event.acceptProposedAction()
+                    return
+        event.ignore()
+
+    def dropEvent(self, event):
+        for url in event.mimeData().urls():
+            if url.isLocalFile():
+                path = url.toLocalFile()
+                if Path(path).suffix.lower() in self._VIDEO_EXTENSIONS:
+                    self.load_video(path)
+                    event.acceptProposedAction()
+                    return
+        event.ignore()
+
     def keyPressEvent(self, event):
         # Get modifier keys
         modifiers = event.modifiers()
-        
+        key = event.key()
+
+        # Shift held = show zoom-selection overlay
+        if key == Qt.Key.Key_Shift:
+            self.zoom_overlay.setGeometry(self.video_widget.rect())
+            self.zoom_overlay.show()
+            self.zoom_overlay.raise_()
+            event.accept()
+            return
+
         # Alt + Arrow keys = Pan (when zoomed)
+        # MUST be checked FIRST before any other key handling
         if modifiers & Qt.KeyboardModifier.AltModifier:
             current_zoom = self.zoom_spinbox.value()
+            pan_speed = 0.05  # Adjust for faster/slower panning
+        
+            if current_zoom > 100:  # Only pan when zoomed in
             
-            if current_zoom > 100:  # Only pan when zoomed
-                pan_speed = 0.05  # Adjust this for faster/slower panning
-                
-                if event.key() == Qt.Key.Key_Left:
-                    # Pan left
-                    try:
-                        current_pan_x = self.player.video_pan_x or 0.0
-                        self.player.video_pan_x = max(-1.0, current_pan_x - pan_speed)
-                    except:
-                        self.player.video_pan_x = -pan_speed
-                    
-                elif event.key() == Qt.Key.Key_Right:
-                    # Pan right
+                if key == Qt.Key.Key_Left:
                     try:
                         current_pan_x = self.player.video_pan_x or 0.0
                         self.player.video_pan_x = min(1.0, current_pan_x + pan_speed)
-                    except:
-                        self.player.video_pan_x = pan_speed
-                    
-                elif event.key() == Qt.Key.Key_Up:
-                    # Pan up
+                    except Exception as e:
+                        print(f"Pan left error: {e}")
+
+                elif key == Qt.Key.Key_Right:
                     try:
-                        current_pan_y = self.player.video_pan_y or 0.0
-                        self.player.video_pan_y = max(-1.0, current_pan_y - pan_speed)
-                    except:
-                        self.player.video_pan_y = -pan_speed
-                    
-                elif event.key() == Qt.Key.Key_Down:
-                    # Pan down
+                        current_pan_x = self.player.video_pan_x or 0.0
+                        self.player.video_pan_x = max(-1.0, current_pan_x - pan_speed)
+                    except Exception as e:
+                        print(f"Pan right error: {e}")
+
+                elif key == Qt.Key.Key_Up:
                     try:
                         current_pan_y = self.player.video_pan_y or 0.0
                         self.player.video_pan_y = min(1.0, current_pan_y + pan_speed)
-                    except:
-                        self.player.video_pan_y = pan_speed
+                    except Exception as e:
+                        print(f"Pan up error: {e}")
+
+                elif key == Qt.Key.Key_Down:
+                    try:
+                        current_pan_y = self.player.video_pan_y or 0.0
+                        self.player.video_pan_y = max(-1.0, current_pan_y - pan_speed)
+                    except Exception as e:
+                        print(f"Pan down error: {e}")
+            else:
+                # Not zoomed in enough to pan
+                print(f"Zoom is {current_zoom}% - zoom in more to pan (needs to be > 100%)")
         
-        # Regular arrow keys without Alt = Seek video
-        elif event.key() == Qt.Key.Key_Left:
+            # IMPORTANT: Accept the event so it doesn't propagate
+            event.accept()
+            return  # Exit early - don't process as any other key
+    
+        # No modifier keys below this line
+        # Left/Right arrows = Seek video
+        if key == Qt.Key.Key_Left:
             if self.player.time_pos:
                 self.player.seek(-5, reference='relative')
-        
-        elif event.key() == Qt.Key.Key_Right:
+    
+        elif key == Qt.Key.Key_Right:
             if self.player.time_pos:
                 self.player.seek(5, reference='relative')
-        
-        # Up/Down arrows = Zoom in/out
-        elif event.key() == Qt.Key.Key_Up:
+    
+        # Up/Down arrows = Zoom in/out (NO ALT modifier)
+        elif key == Qt.Key.Key_Up:
             current_zoom = self.zoom_spinbox.value()
             self.zoom_spinbox.setValue(min(300, current_zoom + 10))
-        
-        elif event.key() == Qt.Key.Key_Down:
+    
+        elif key == Qt.Key.Key_Down:
             current_zoom = self.zoom_spinbox.value()
             self.zoom_spinbox.setValue(max(50, current_zoom - 10))
-        
+    
         # Spacebar = Play/Pause
-        elif event.key() == Qt.Key.Key_Space:
+        elif key == Qt.Key.Key_Space:
             self.toggle_play_pause()
-        
+    
         # I = Mark In
-        elif event.key() == Qt.Key.Key_I:
+        elif key == Qt.Key.Key_I:
             self.mark_in()
-        
+    
         # O = Mark Out
-        elif event.key() == Qt.Key.Key_O:
+        elif key == Qt.Key.Key_O:
             self.mark_out()
-        
+    
         # R = Replay Section
-        elif event.key() == Qt.Key.Key_R:
+        elif key == Qt.Key.Key_R:
             self.replay_section()
-        
+
+        # S = Screenshot
+        elif key == Qt.Key.Key_S:
+            self.take_screenshot()
+
         else:
             super().keyPressEvent(event)
     
+    def keyReleaseEvent(self, event):
+        if event.key() == Qt.Key.Key_Shift:
+            self.zoom_overlay.hide()
+            self.zoom_overlay._active = False
+            self.zoom_overlay._rect = QRect()
+            self.zoom_overlay._origin = None
+        else:
+            super().keyReleaseEvent(event)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, 'zoom_overlay'):
+            self.zoom_overlay.setGeometry(self.video_widget.rect())
+
     def closeEvent(self, event):
         """Properly cleanup when closing the application"""
         try:
