@@ -15,7 +15,8 @@ if sys.platform == 'win32':
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QPushButton, QSlider, QLabel,
                              QFileDialog, QToolBar, QStyle, QMessageBox,
-                             QComboBox, QSpinBox, QInputDialog, QGraphicsOpacityEffect)
+                             QComboBox, QSpinBox, QInputDialog, QGraphicsOpacityEffect,
+                             QStyleOptionSlider)
 from PyQt6.QtCore import Qt, QTimer, QUrl, QPropertyAnimation, QEasingCurve, QPoint, QRect, QEvent
 from PyQt6.QtGui import QAction, QKeySequence, QCursor, QFont, QPainter, QPen, QColor, QBrush
 import mpv
@@ -26,6 +27,37 @@ from settings_dialog import SettingsDialog
 
 # Fix for Windows locale
 locale.setlocale(locale.LC_NUMERIC, 'C')
+
+class BufferedSlider(QSlider):
+    """Horizontal slider that draws a semi-transparent buffer-fill behind the handle."""
+
+    def __init__(self, orientation, parent=None):
+        super().__init__(orientation, parent)
+        self._buffer_pct = 0
+
+    def set_buffer(self, pct):
+        pct = max(0, min(100, int(pct)))
+        if self._buffer_pct != pct:
+            self._buffer_pct = pct
+            self.update()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if self._buffer_pct <= 0:
+            return
+        opt = QStyleOptionSlider()
+        self.initStyleOption(opt)
+        groove = self.style().subControlRect(
+            QStyle.ComplexControl.CC_Slider, opt,
+            QStyle.SubControl.SC_SliderGroove, self
+        )
+        if groove.width() > 0:
+            buf_rect = groove.adjusted(0, 0, 0, 0)
+            buf_rect.setWidth(int(groove.width() * self._buffer_pct / 100))
+            painter = QPainter(self)
+            painter.fillRect(buf_rect, QColor(80, 140, 255, 75))
+            painter.end()
+
 
 class ZoomOverlay(QWidget):
     """Transparent overlay for Shift+click-drag region zoom selection."""
@@ -164,7 +196,7 @@ class VideoPlayer(QMainWindow):
         # Progress bar
         progress_layout = QHBoxLayout()
         self.time_label = QLabel("00:00:00 / 00:00:00")
-        self.progress_slider = QSlider(Qt.Orientation.Horizontal)
+        self.progress_slider = BufferedSlider(Qt.Orientation.Horizontal)
         self.progress_slider.setRange(0, 100)
         self.progress_slider.sliderMoved.connect(self.seek_video)
         progress_layout.addWidget(self.time_label)
@@ -284,7 +316,13 @@ class VideoPlayer(QMainWindow):
         network_action.setShortcut(QKeySequence("Ctrl+N"))
         network_action.triggered.connect(self.open_file_native_network)
         toolbar.addAction(network_action)
-        
+
+        # Stream URL
+        stream_action = QAction("Stream URL", self)
+        stream_action.setShortcut(QKeySequence("Ctrl+U"))
+        stream_action.triggered.connect(self.open_url)
+        toolbar.addAction(stream_action)
+
         toolbar.addSeparator()
         
         # Screenshot
@@ -350,11 +388,14 @@ class VideoPlayer(QMainWindow):
                 wid=str(int(self.video_widget.winId())),
                 input_default_bindings=True,
                 input_vo_keyboard=True,
-                hwdec='auto-copy',
+                hwdec='no',
                 vo='gpu',
                 keep_open='yes',
                 loop='no',
-                deinterlace=True
+                deinterlace=True,
+                cache='yes',
+                demuxer_max_bytes=67108864,   # 64 MB forward buffer
+                demuxer_readahead_secs=30,    # buffer up to 30 s ahead
             )
             self.player.volume = 50
             self.current_rotation = 0
@@ -548,6 +589,17 @@ class VideoPlayer(QMainWindow):
             self.last_folder = os.path.dirname(file_path)
             self.load_video(file_path)
     
+    def open_url(self):
+        """Open a streaming URL (HTTP, HTTPS, RTSP, RTMP, HLS, etc.)"""
+        url, ok = QInputDialog.getText(
+            self,
+            "Open Stream URL",
+            "Enter stream URL (http://, https://, rtsp://, rtmp://, hls://):",
+            text="https://"
+        )
+        if ok and url.strip():
+            self.load_video(url.strip())
+
     def open_path_directly(self):
         """Open a file by typing/pasting the full path - works with UNC paths and mapped drives"""
         # Get all available drives
@@ -636,12 +688,18 @@ class VideoPlayer(QMainWindow):
                     f"- Make sure you have network access")
     
     def load_video(self, file_path):
-        """Load and play a video file"""
+        """Load and play a video file or stream URL"""
         try:
             self.current_file = file_path
             self.player.play(file_path)
             self.play_button.setText("Pause")
-            self.setWindowTitle(f"Video Player - {Path(file_path).name}")
+            if '://' in file_path:
+                from urllib.parse import urlparse
+                parsed = urlparse(file_path)
+                display_name = parsed.path.rstrip('/').split('/')[-1] or parsed.netloc or file_path
+            else:
+                display_name = Path(file_path).name
+            self.setWindowTitle(f"Video Player - {display_name}")
             self.mark_in_pos = None
             self.mark_out_pos = None
             # Reset screenshot counter for new video
@@ -852,26 +910,37 @@ class VideoPlayer(QMainWindow):
             print(f"Error resetting color correction: {e}")
     
     def update_progress(self):
-        """Update the progress bar and time display"""
+        """Update the progress bar, buffer indicator, and time display"""
         try:
-            # Check if player is still alive
             if not hasattr(self, 'player'):
                 return
-            
+
             if self.player.duration:
                 current_time = self.player.time_pos or 0
                 duration = self.player.duration
-                
+
                 progress = int((current_time / duration) * 100)
                 self.progress_slider.blockSignals(True)
                 self.progress_slider.setValue(progress)
                 self.progress_slider.blockSignals(False)
-                
+
                 current_str = self.format_time(current_time)
                 duration_str = self.format_time(duration)
                 self.time_label.setText(f"{current_str} / {duration_str}")
+
+                # Buffer indicator: use demuxer cache state to find cache end PTS
+                try:
+                    cache_state = self.player.demuxer_cache_state
+                    if cache_state and 'cache-end' in cache_state:
+                        buf_pct = int(min(100, cache_state['cache-end'] / duration * 100))
+                    else:
+                        buf_pct = 0
+                except Exception:
+                    buf_pct = 0
+                self.progress_slider.set_buffer(buf_pct)
+            else:
+                self.progress_slider.set_buffer(0)
         except Exception:
-            # Silently ignore errors (player might be shutting down)
             pass
     
     def format_time(self, seconds):
