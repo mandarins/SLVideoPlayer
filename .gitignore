@@ -1,3 +1,7 @@
 libmpv-2.dll
 .vs/
 libmpv-2.dll
+.venv/
+__pycache__/
+settings.json
+recent_files.json

@@ -5,6 +5,7 @@ import locale
 import string
 import tempfile
 import json
+import math
 from pathlib import Path
 
 # Fix MPV DLL path for Windows
@@ -17,16 +18,13 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QFileDialog, QToolBar, QStyle, QMessageBox,
                              QComboBox, QSpinBox, QInputDialog, QGraphicsOpacityEffect,
                              QStyleOptionSlider)
-from PyQt6.QtCore import Qt, QTimer, QUrl, QPropertyAnimation, QEasingCurve, QPoint, QRect, QEvent
+from PyQt6.QtCore import Qt, QTimer, QUrl, QPropertyAnimation, QEasingCurve, QPoint, QRect, QRectF, QEvent
 from PyQt6.QtGui import QAction, QKeySequence, QCursor, QFont, QPainter, QPen, QColor, QBrush
 import mpv
 from color_dialog import ColorCorrectionDialog
 from recent_files_dialog import RecentFilesDialog
 from settings import Settings
 from settings_dialog import SettingsDialog
-
-# Fix for Windows locale
-locale.setlocale(locale.LC_NUMERIC, 'C')
 
 class BufferedSlider(QSlider):
     """Horizontal slider that draws a semi-transparent buffer-fill behind the handle."""
@@ -60,92 +58,72 @@ class BufferedSlider(QSlider):
 
 
 class ZoomOverlay(QWidget):
-    """Transparent overlay for Shift+click-drag region zoom selection."""
+    """Captures Shift+drag over the video and zooms to the selected region.
+
+    The selection box is drawn with mpv's OSD because mpv's native video window
+    paints over any Qt widget stacked on top of it.
+    """
+
+    OSD_ID = 1
+    BOX_STYLE = "{\\an7\\pos(0,0)\\bord2\\shad0\\1c&HD77800&\\1a&HC0&\\3c&HD77800&\\p1}"
 
     def __init__(self, parent, player_ref):
         super().__init__(parent)
         self.player_ref = player_ref  # reference to VideoPlayer instance
-        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
-        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        self.setMouseTracking(True)
         self._origin = None
-        self._rect = QRect()
-        self._active = False
         self.hide()  # hidden until Shift is held
 
-    # ---- drawing ----
-    def paintEvent(self, event):
-        if not self._active or self._rect.isNull():
-            return
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        # Semi-transparent fill
-        painter.setBrush(QBrush(QColor(0, 120, 215, 50)))
-        # Solid border
-        pen = QPen(QColor(0, 120, 215, 200), 2, Qt.PenStyle.SolidLine)
-        painter.setPen(pen)
-        painter.drawRect(self._rect.normalized())
-        painter.end()
-
-    # ---- mouse handling ----
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
-            self._origin = event.pos()
-            self._rect = QRect(self._origin, self._origin)
-            self._active = True
-            self.update()
+            self._origin = event.position()
 
     def mouseMoveEvent(self, event):
-        if self._active and self._origin is not None:
-            self._rect = QRect(self._origin, event.pos()).normalized()
-            self.update()
+        if self._origin is not None:
+            self._draw_box(self._selection(event.position()))
 
     def mouseReleaseEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton and self._active:
-            self._active = False
-            rect = QRect(self._origin, event.pos()).normalized()
-            self._rect = QRect()
-            self.update()
-            # Only zoom if the selection is large enough (avoid accidental clicks)
-            if rect.width() > 10 and rect.height() > 10:
-                self._apply_region_zoom(rect)
-            self._origin = None
-
-    # ---- compute zoom + pan from selected rectangle ----
-    def _apply_region_zoom(self, rect):
-        vp = self.player_ref
-        widget_w = self.width()
-        widget_h = self.height()
-
-        if widget_w == 0 or widget_h == 0:
+        if event.button() != Qt.MouseButton.LeftButton or self._origin is None:
             return
+        rect = self._selection(event.position())
+        self.cancel()
+        if rect.width() > 10:  # ignore accidental clicks
+            self._zoom_to(rect)
 
-        # Normalised centre of the selected rectangle (0-1 range, 0.5 = centre)
-        sel_cx = (rect.x() + rect.width() / 2) / widget_w
-        sel_cy = (rect.y() + rect.height() / 2) / widget_h
+    def cancel(self):
+        self._origin = None
+        self.player_ref.player.command('osd-overlay', self.OSD_ID, 'none', '')
 
-        # Zoom factor: fit the smaller dimension ratio so the selection fills the view
-        zoom_x = widget_w / rect.width()
-        zoom_y = widget_h / rect.height()
-        zoom_factor = min(zoom_x, zoom_y)
+    def _selection(self, pos):
+        """Box from the drag origin toward pos, locked to the view's aspect ratio so it fills the view exactly."""
+        aspect = self.width() / self.height()
+        dx = pos.x() - self._origin.x()
+        dy = pos.y() - self._origin.y()
+        w = max(abs(dx), abs(dy) * aspect)
+        h = w / aspect
+        x = self._origin.x() - w if dx < 0 else self._origin.x()
+        y = self._origin.y() - h if dy < 0 else self._origin.y()
+        return QRectF(x, y, w, h)
 
-        # Clamp to the spinbox range (50%-300%)
-        zoom_percent = max(50, min(300, int(zoom_factor * 100)))
+    def _draw_box(self, r):
+        path = (f"m {r.left():.0f} {r.top():.0f} l {r.right():.0f} {r.top():.0f} "
+                f"{r.right():.0f} {r.bottom():.0f} {r.left():.0f} {r.bottom():.0f}")
+        self.player_ref.player.command('osd-overlay', self.OSD_ID, 'ass-events',
+                                       self.BOX_STYLE + path, self.width(), self.height())
 
-        # Pan: MPV pan is the offset from centre in fractions of the video size.
-        # positive pan_x = video shifts right = viewport sees left side
-        # We want the selection centre to become the new viewport centre.
-        pan_x = 0.5 - sel_cx   # offset from widget centre
-        pan_y = 0.5 - sel_cy
-
-        # Apply
-        try:
-            vp.zoom_spinbox.setValue(zoom_percent)
-            vp.player.video_pan_x = max(-1.0, min(1.0, pan_x))
-            vp.player.video_pan_y = max(-1.0, min(1.0, pan_y))
-        except Exception as e:
-            print(f"Region zoom error: {e}")
+    def _zoom_to(self, rect):
+        vp = self.player_ref
+        osd = vp.player.osd_dimensions
+        # osd-dimensions are in physical pixels and include letterboxing plus any current zoom/pan
+        scale = osd['w'] / self.width()
+        video_w = osd['w'] - osd['ml'] - osd['mr']
+        video_h = osd['h'] - osd['mt'] - osd['mb']
+        fx = (rect.center().x() * scale - osd['ml']) / video_w
+        fy = (rect.center().y() * scale - osd['mt']) / video_h
+        current_zoom = 2 ** (vp.player.video_zoom or 0)
+        vp.zoom_spinbox.setValue(round(current_zoom * self.width() / rect.width() * 100))
+        # Pan is in fractions of the scaled video, so this centres the selection at any zoom
+        vp.player.video_pan_x = 0.5 - fx
+        vp.player.video_pan_y = 0.5 - fy
 
 
 class VideoPlayer(QMainWindow):
@@ -234,7 +212,7 @@ class VideoPlayer(QMainWindow):
         # Zoom control
         playback_layout.addWidget(QLabel("Zoom:"))
         self.zoom_spinbox = QSpinBox()
-        self.zoom_spinbox.setRange(50, 300)
+        self.zoom_spinbox.setRange(50, 1000)
         self.zoom_spinbox.setValue(100)
         self.zoom_spinbox.setSuffix("%")
         self.zoom_spinbox.valueChanged.connect(self.apply_zoom)
@@ -383,11 +361,15 @@ class VideoPlayer(QMainWindow):
         toolbar.addSeparator()
 
     def init_player(self):
+        # mpv auto-picks Wayland when WAYLAND_DISPLAY is set, opening its own surface instead of embedding.
+        # Its X11 window also swallows mouse and key events, so leave input to Qt (Shift+drag zoom, wheel stepping).
+        linux_opts = ({'gpu_context': 'x11egl', 'input_cursor': False, 'input_vo_keyboard': False}
+                      if sys.platform.startswith('linux') else {'input_vo_keyboard': True})
         try:
             self.player = mpv.MPV(
+                **linux_opts,
                 wid=str(int(self.video_widget.winId())),
                 input_default_bindings=True,
-                input_vo_keyboard=True,
                 hwdec='no',
                 vo='gpu',
                 keep_open='yes',
@@ -795,7 +777,7 @@ class VideoPlayer(QMainWindow):
     
     def apply_zoom(self, value):
         zoom_factor = value / 100.0
-        self.player.video_zoom = zoom_factor - 1.0  # MPV uses 0 as 100%
+        self.player.video_zoom = math.log2(zoom_factor)  # mpv zoom is a log2 scale
     
     def change_aspect_ratio(self, aspect):
         if aspect == "Default":
@@ -1086,14 +1068,14 @@ class VideoPlayer(QMainWindow):
                 self.flash_text(f"Screenshot saved: {Path(save_path).name}")
             else:
                 # Zoomed - need to capture the zoomed area
-                self.take_zoomed_screenshot(save_path, current_zoom)
+                self.take_zoomed_screenshot(save_path)
                 self.screenshot_counter += 1
 
         except Exception as e:
             self.flash_text(f"Screenshot failed: {str(e)}")
 
-    def take_zoomed_screenshot(self, save_path, zoom_percent):
-        """Take a screenshot of the zoomed area using video pan/zoom values"""
+    def take_zoomed_screenshot(self, save_path):
+        """Save the part of the frame currently visible in the window"""
         try:
             from PIL import Image
             
@@ -1107,32 +1089,14 @@ class VideoPlayer(QMainWindow):
             img = Image.open(temp_path)
             width, height = img.size
             
-            # Calculate the visible area based on zoom
-            zoom_factor = zoom_percent / 100.0
-            
-            # Get pan values (MPV video-pan-x and video-pan-y)
-            # These determine where the center of the zoomed view is
-            try:
-                pan_x = self.player.video_pan_x or 0.0
-                pan_y = self.player.video_pan_y or 0.0
-            except:
-                pan_x = 0.0
-                pan_y = 0.0
-            
-            # Calculate the crop rectangle
-            # When zoomed in, we see less of the image
-            visible_width = width / zoom_factor
-            visible_height = height / zoom_factor
-            
-            # Center point (accounting for pan)
-            center_x = (width / 2) + (pan_x * width)
-            center_y = (height / 2) + (pan_y * height)
-            
-            # Calculate crop box
-            left = max(0, int(center_x - visible_width / 2))
-            top = max(0, int(center_y - visible_height / 2))
-            right = min(width, int(center_x + visible_width / 2))
-            bottom = min(height, int(center_y + visible_height / 2))
+            # Map the window onto the frame: osd-dimensions give where mpv draws the video,
+            # already including zoom, pan and letterboxing
+            osd = self.player.osd_dimensions
+            scale = (osd['w'] - osd['ml'] - osd['mr']) / width
+            left = max(0, int(-osd['ml'] / scale))
+            top = max(0, int(-osd['mt'] / scale))
+            right = min(width, int((osd['w'] - osd['ml']) / scale))
+            bottom = min(height, int((osd['h'] - osd['mt']) / scale))
             
             # Crop the image
             cropped = img.crop((left, top, right, bottom))
@@ -1296,7 +1260,7 @@ class VideoPlayer(QMainWindow):
         # Up/Down arrows = Zoom in/out (NO ALT modifier)
         elif key == Qt.Key.Key_Up:
             current_zoom = self.zoom_spinbox.value()
-            self.zoom_spinbox.setValue(min(300, current_zoom + 10))
+            self.zoom_spinbox.setValue(min(1000, current_zoom + 10))
     
         elif key == Qt.Key.Key_Down:
             current_zoom = self.zoom_spinbox.value()
@@ -1328,9 +1292,7 @@ class VideoPlayer(QMainWindow):
     def keyReleaseEvent(self, event):
         if event.key() == Qt.Key.Key_Shift:
             self.zoom_overlay.hide()
-            self.zoom_overlay._active = False
-            self.zoom_overlay._rect = QRect()
-            self.zoom_overlay._origin = None
+            self.zoom_overlay.cancel()
         else:
             super().keyReleaseEvent(event)
 
@@ -1368,7 +1330,12 @@ class VideoPlayer(QMainWindow):
 
 
 if __name__ == '__main__':
+    # mpv can only embed into a Qt widget via an X11 window id; native Wayland breaks the layout
+    if sys.platform.startswith('linux'):
+        os.environ.setdefault('QT_QPA_PLATFORM', 'xcb')
     app = QApplication(sys.argv)
+    # mpv requires a C numeric locale; QApplication resets it on Linux, so set it afterwards
+    locale.setlocale(locale.LC_NUMERIC, 'C')
     player = VideoPlayer()
     player.show()
     sys.exit(app.exec())
