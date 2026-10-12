@@ -136,6 +136,7 @@ class VideoPlayer(QMainWindow):
         self.max_recent_files = 50  # Maximum number of recent files to keep
         self.recent_files_path = "recent_files.json"  # File to save recent files
         self.settings = Settings()  # Initialize settings
+        self._drag_last = None  # last mouse position while drag-panning
         
         # Frame stepping mode variables
         self.frame_step_mode = False
@@ -1153,7 +1154,30 @@ class VideoPlayer(QMainWindow):
             ):
                 self._apply_pan(key)
                 return True  # consume — no widget zooms or scrolls
+        if obj is self.video_widget and self.zoom_spinbox.value() > 100 and self._drag_pan(event):
+            return True
         return super().eventFilter(obj, event)
+
+    def _drag_pan(self, event):
+        """Move the zoomed video with a left-button drag; returns True if the event was used."""
+        event_type = event.type()
+        if event_type == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
+            self._drag_last = event.position()
+            self.video_widget.setCursor(Qt.CursorShape.ClosedHandCursor)
+        elif event_type == QEvent.Type.MouseMove and self._drag_last is not None:
+            delta = event.position() - self._drag_last
+            self._drag_last = event.position()
+            # Pan is in fractions of the displayed video; osd-dimensions are physical pixels
+            osd = self.player.osd_dimensions
+            scale = osd['w'] / self.video_widget.width()
+            self.player.video_pan_x = (self.player.video_pan_x or 0.0) + delta.x() * scale / (osd['w'] - osd['ml'] - osd['mr'])
+            self.player.video_pan_y = (self.player.video_pan_y or 0.0) + delta.y() * scale / (osd['h'] - osd['mt'] - osd['mb'])
+        elif event_type == QEvent.Type.MouseButtonRelease and self._drag_last is not None:
+            self._drag_last = None
+            self.video_widget.unsetCursor()
+        else:
+            return False
+        return True
 
     def _apply_pan(self, key):
         if self.zoom_spinbox.value() <= 100:
@@ -1338,4 +1362,6 @@ if __name__ == '__main__':
     locale.setlocale(locale.LC_NUMERIC, 'C')
     player = VideoPlayer()
     player.show()
+    if len(sys.argv) > 1:
+        player.load_video(sys.argv[1])
     sys.exit(app.exec())
